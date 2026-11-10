@@ -105,15 +105,34 @@ function openIndexedDB(): Promise<IDBDatabase> {
       reject(new Error('IndexedDB not supported'));
       return;
     }
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME);
-      }
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    const timer = setTimeout(() => {
+      reject(new Error('IndexedDB open timeout'));
+    }, 1500);
+
+    try {
+      const request = indexedDB.open(DB_NAME, DB_VERSION);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          db.createObjectStore(STORE_NAME);
+        }
+      };
+      request.onsuccess = () => {
+        clearTimeout(timer);
+        resolve(request.result);
+      };
+      request.onerror = () => {
+        clearTimeout(timer);
+        reject(request.error);
+      };
+      request.onblocked = () => {
+        clearTimeout(timer);
+        reject(new Error('IndexedDB blocked'));
+      };
+    } catch (err) {
+      clearTimeout(timer);
+      reject(err);
+    }
   });
 }
 
@@ -195,8 +214,30 @@ function mergeWithDefaults(partial: Partial<PersistentAppState>): PersistentAppS
       : [],
   };
 
+  const normalizedContacts: Contact[] = Array.isArray(partial.contacts)
+    ? partial.contacts.map((c, idx) => ({
+        id: c.id || `cnt_restored_${idx}`,
+        brandName: typeof c.brandName === 'string' ? c.brandName : '',
+        email: typeof c.email === 'string' ? c.email : '',
+        status: c.status || 'Pending',
+        excluded: Boolean(c.excluded),
+        validationFlags: {
+          missingBrand: Boolean(c.validationFlags?.missingBrand),
+          invalidEmail: Boolean(c.validationFlags?.invalidEmail),
+          duplicateEmail: Boolean(c.validationFlags?.duplicateEmail),
+          duplicateBrand: Boolean(c.validationFlags?.duplicateBrand),
+        },
+        customSubject: c.customSubject,
+        customBody: c.customBody,
+        importedAt: c.importedAt || new Date().toISOString(),
+        lastProcessedAt: c.lastProcessedAt,
+        sourceFile: c.sourceFile,
+        sheetName: c.sheetName,
+      }))
+    : [];
+
   return {
-    contacts: Array.isArray(partial.contacts) ? partial.contacts : [],
+    contacts: normalizedContacts,
     templates,
     history: Array.isArray(partial.history) ? partial.history : [],
     activityLog: Array.isArray(partial.activityLog) ? partial.activityLog : [],

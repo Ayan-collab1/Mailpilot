@@ -62,11 +62,16 @@ export default function App() {
   // Load persisted IndexedDB / localStorage state on mount
   useEffect(() => {
     let mounted = true;
-    loadAppState().then((loaded) => {
-      if (!mounted) return;
-      setAppState(loaded);
-      setIsLoaded(true);
-    });
+    loadAppState()
+      .then((loaded) => {
+        if (!mounted) return;
+        setAppState(loaded);
+        setIsLoaded(true);
+      })
+      .catch(() => {
+        if (!mounted) return;
+        setIsLoaded(true);
+      });
     return () => {
       mounted = false;
     };
