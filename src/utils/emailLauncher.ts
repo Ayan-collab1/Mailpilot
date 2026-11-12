@@ -31,7 +31,6 @@ export function personalizeTemplate(
       .replace(/\{\s*company\s*\}/gi, safeBrand)
       .replace(/\{\s*email\s*\}/gi, safeEmail)
       .replace(/\{\s*email_address\s*\}/gi, safeEmail)
-      // Fallback cleanup so no accidental single-brace {placeholder} remains unresolved
       .replace(/\{([a-zA-Z0-9_]+)\}/g, (_, key: string) => {
         const lower = key.toLowerCase();
         if (lower.includes('brand') || lower.includes('company')) return safeBrand;
@@ -58,8 +57,6 @@ export function isMobileEnvironment(): boolean {
 /**
  * Builds a properly URL-encoded RFC 6068 mailto link for Android / Thunderbird / desktop mail handlers,
  * or web compose URLs when a web client is explicitly selected.
- * Preserves literal '@' in the recipient address path so Android mailto intent resolvers and Thunderbird
- * populate the To, Subject, and Body fields accurately.
  */
 export function buildEmailComposeUrl(
   emailApp: EmailAppType,
@@ -68,11 +65,9 @@ export function buildEmailComposeUrl(
   const cleanRecipient = email.to.trim();
   const toQueryEncoded = encodeURIComponent(cleanRecipient);
   const subjectEncoded = encodeURIComponent(email.subject);
-  // Normalize line breaks to CRLF per RFC 6068 so Android email intents (Thunderbird) preserve paragraphs
   const normalizedBody = email.body.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
   const bodyEncoded = encodeURIComponent(normalizedBody);
 
-  // Standard RFC 6068 mailto URI for Android Intent.ACTION_SENDTO and desktop mail handlers
   const standardMailto = `mailto:${cleanRecipient}?subject=${subjectEncoded}&body=${bodyEncoded}`;
 
   switch (emailApp) {
@@ -119,11 +114,6 @@ export interface LaunchEmailResult {
   fallbackMailto: string;
 }
 
-/**
- * Triggers the email intent (mailto: for Android / Thunderbird / system mail handlers, or web compose).
- * Note: Web browsers cannot force a specific native app to open; Android handles the mailto intent
- * via the user's default mail handler or displays the compatible email application chooser.
- */
 export function launchEmailApplication(
   emailApp: EmailAppType,
   email: PersonalizedEmail
@@ -134,7 +124,6 @@ export function launchEmailApplication(
     const link = document.createElement('a');
     if (method === 'mailto') {
       link.href = url;
-      // Trigger mailto intent at top frame so Android / OS intercepts the mailto: URI scheme cleanly
       link.target = '_top';
       link.rel = 'noopener noreferrer';
       document.body.appendChild(link);
@@ -144,8 +133,7 @@ export function launchEmailApplication(
       return {
         success: true,
         usedMethod: 'mailto_link',
-        message:
-          'Triggered the standard mailto email intent with recipient, subject, and message pre-filled. Android will open your configured handler (such as Thunderbird) or show available email apps. Review and send the message inside your email app, then return here and click "Mark as Sent". If your email app did not open, use the Copy Recipient, Copy Subject, and Copy Message buttons below.',
+        message: 'Email intent opened. Confirm after sending.',
         composeUrl: url,
         fallbackMailto,
       };
@@ -161,7 +149,7 @@ export function launchEmailApplication(
       return {
         success: true,
         usedMethod: 'anchor_tab',
-        message: `Opened ${appLabel} compose window with recipient, subject, and personalized message pre-filled. Review and click Send inside ${appLabel}, then confirm below.`,
+        message: `${appLabel} compose opened. Confirm after sending.`,
         composeUrl: url,
         fallbackMailto,
       };
@@ -170,8 +158,7 @@ export function launchEmailApplication(
     return {
       success: false,
       usedMethod: 'fallback',
-      message:
-        'Could not automatically launch the email intent due to browser restrictions. Tap the direct mailto link or use the Copy Recipient, Copy Subject, and Copy Message buttons below.',
+      message: 'Could not launch email app automatically. Use the direct link or copy buttons.',
       composeUrl: url,
       fallbackMailto,
     };
@@ -186,37 +173,32 @@ export const EMAIL_APP_OPTIONS: {
 }[] = [
   {
     id: 'thunderbird_mailto',
-    label: 'Thunderbird / Android Email Intent (mailto)',
-    shortLabel: 'Thunderbird / Mailto Intent',
-    description:
-      'Triggers the standard mailto intent so Android opens Thunderbird (or displays installed compatible email apps) with recipient, subject, and body pre-filled.',
+    label: 'Thunderbird / Android Mailto',
+    shortLabel: 'Thunderbird / Mailto',
+    description: 'Standard mailto intent for Thunderbird & Android',
   },
   {
     id: 'default_mailto',
-    label: 'System Default Email Application (mailto)',
+    label: 'Default Email App',
     shortLabel: 'Default Email App',
-    description:
-      'Launches your device default mail handler via a standard encoded mailto link.',
+    description: 'System default mailto handler',
   },
   {
     id: 'compatible_mailto',
-    label: 'Other Compatible Mail Apps (Mailto + Copy Fallback)',
+    label: 'Compatible Mailto',
     shortLabel: 'Compatible Mailto',
-    description:
-      'Universal RFC-6068 mailto link paired with separate Copy Recipient, Copy Subject, and Copy Message controls.',
+    description: 'Universal mailto with copy fallback',
   },
   {
     id: 'gmail',
-    label: 'Gmail (Web Compose)',
+    label: 'Gmail Web',
     shortLabel: 'Gmail Web',
-    description:
-      'Opens Gmail web compose in a browser tab with recipient, subject, and body pre-filled.',
+    description: 'Browser compose tab',
   },
   {
     id: 'outlook',
-    label: 'Outlook (Web Compose)',
+    label: 'Outlook Web',
     shortLabel: 'Outlook Web',
-    description:
-      'Opens Outlook web compose in a browser tab with recipient, subject, and body pre-filled.',
+    description: 'Browser compose tab',
   },
 ];

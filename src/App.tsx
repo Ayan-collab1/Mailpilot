@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   FileText,
   History,
@@ -18,6 +18,7 @@ import {
   ActivityLogItem,
   AppSettings,
   BatchQueueState,
+  BrandGroup,
   CandidateContact,
   Contact,
   EmailTemplate,
@@ -33,10 +34,15 @@ import {
   saveAppState,
 } from './services/storage';
 import {
+  extractEmailsFromCell,
   generateSampleWorkbookAnalysis,
-  isValidEmailAddress,
   parseUploadedSpreadsheet,
 } from './utils/excelParser';
+import {
+  buildBrandGroups,
+  getPreferredRecipientForBrand,
+  getQueueBrandGroups,
+} from './utils/brandQueue';
 import { DashboardView } from './components/DashboardView';
 import { ContactListView } from './components/ContactListView';
 import { BatchWorkspaceView } from './components/BatchWorkspaceView';
@@ -123,37 +129,79 @@ export default function App() {
     mode: 'append' | 'replace'
   ) => {
     const nowIso = new Date().toISOString();
+    const stamp = Date.now();
+
+    // Map each candidate's brandTempId to a persistent brandId
+    const brandIdMap = new Map<string, string>();
+    candidates.forEach((c, idx) => {
+      if (!brandIdMap.has(c.brandTempId)) {
+        brandIdMap.set(c.brandTempId, `brand_${stamp}_${idx}`);
+      }
+    });
+
     const newContacts: Contact[] = candidates.map((c, idx) => ({
-      id: `cnt_${Date.now()}_${idx}`,
+      id: `cnt_${stamp}_${idx}`,
+      brandId: brandIdMap.get(c.brandTempId) || `brand_${stamp}_${idx}`,
       brandName: c.brandName.trim(),
       email: c.email.trim(),
+      recipientIndex: c.recipientIndex,
+      totalBrandRecipients: c.totalBrandRecipients,
       status: c.status,
       excluded: c.excluded,
       validationFlags: c.validationFlags,
       importedAt: nowIso,
       sourceFile: fileName,
       sheetName,
+      phone: c.phone,
+      websiteNotes: c.websiteNotes,
+      sourceList: c.sourceList,
+      rawRowData: c.rawRowData,
     }));
 
     setAppState((prev) => {
-      const mergedContacts =
+      const rawMerged =
         mode === 'replace' ? newContacts : [...prev.contacts, ...newContacts];
+      const brandGroups = buildBrandGroups(rawMerged);
+      const flattened = brandGroups.flatMap((bg) => bg.recipients);
+      const queueBrands = getQueueBrandGroups(flattened);
+
+      const firstBrand = queueBrands[0] || null;
+      const firstRec = firstBrand
+        ? getPreferredRecipientForBrand(firstBrand)
+        : null;
+
+      const shouldResetPointer =
+        mode === 'replace' ||
+        !prev.batchState.currentBrandId ||
+        !queueBrands.some((b) => b.brandId === prev.batchState.currentBrandId);
+
+      const importedBrandCount = brandIdMap.size;
       const validIncludedCount = newContacts.filter((c) => !c.excluded).length;
 
       return {
         ...prev,
-        contacts: mergedContacts,
+        contacts: flattened,
         batchState: {
           ...prev.batchState,
-          currentIndex: mode === 'replace' ? 0 : prev.batchState.currentIndex,
+          currentIndex: 0,
+          currentBrandId: shouldResetPointer
+            ? firstBrand?.brandId || null
+            : prev.batchState.currentBrandId,
+          currentRecipientId: shouldResetPointer
+            ? firstRec?.id || null
+            : prev.batchState.currentRecipientId,
+          acknowledgedBrandIds:
+            mode === 'replace' ? [] : prev.batchState.acknowledgedBrandIds,
+          batchBrandLimit: null,
+          batchBrandOffset: 0,
           isActive: validIncludedCount > 0,
           lastUpdated: nowIso,
         },
         activityLog: appendActivity(
           'import',
-          `Imported ${newContacts.length} contacts from ${fileName}`,
-          `${validIncludedCount} valid contacts queued for outreach (${
-            mode === 'replace' ? 'Replaced previous list' : 'Appended to list'
+          `Imported ${importedBrandCount} brands (${newContacts.length} emails) from ${fileName}`,
+          `${validIncludedCount} valid emails queued (${
+            mode === 'replace' ? 'Replaced list' : 'Appended to list'
           })`,
           prev.activityLog
         ),
@@ -163,7 +211,7 @@ export default function App() {
     setPreloadedAnalysis(null);
     showNotice(
       'success',
-      `Successfully imported ${newContacts.length} contacts from "${fileName}".`
+      `Imported ${brandIdMap.size} brands (${newContacts.length} emails) from "${fileName}".`
     );
   };
 
@@ -188,62 +236,130 @@ export default function App() {
     setIsImportModalOpen(true);
   };
 
-  const handleUpdateContact = (contactId: string, updates: Partial<Contact>) => {
-    setAppState((prev) => ({
-      ...prev,
-      contacts: prev.contacts.map((c) =>
-        c.id === contactId ? { ...c, ...updates } : c
-      ),
-    }));
+  const handleUpdateContact = (
+    contactId: string,
+    updates: Partial<Contact>
+  ) => {
+    setAppState((prev) => {
+      const target = prev.contacts.find((c) => c.id === contactId);
+      const updated = prev.contacts.map((c) => {
+        if (c.id === contactId) {
+          return { ...c, ...updates };
+        }
+        // If brandName was edited, keep all recipients in the same brand group in sync
+        if (
+          target &&
+          updates.brandName !== undefined &&
+          c.brandId === target.brandId
+        ) {
+          return {
+            ...c,
+            brandName: updates.brandName,
+            validationFlags: {
+              ...c.validationFlags,
+              missingBrand: updates.brandName.trim().length === 0,
+            },
+          };
+        }
+        return c;
+      });
+
+      return {
+        ...prev,
+        contacts: updated,
+      };
+    });
   };
 
   const handleDeleteContact = (contactId: string) => {
-    setAppState((prev) => ({
-      ...prev,
-      contacts: prev.contacts.filter((c) => c.id !== contactId),
-    }));
+    setAppState((prev) => {
+      const remaining = prev.contacts.filter((c) => c.id !== contactId);
+      const brandGroups = buildBrandGroups(remaining);
+      const flattened = brandGroups.flatMap((bg) => bg.recipients);
+      return {
+        ...prev,
+        contacts: flattened,
+      };
+    });
   };
 
-  const handleAddManualContact = (brandName: string, email: string) => {
-    const valid = isValidEmailAddress(email);
+  const handleDeleteBrandGroup = (brandId: string) => {
+    setAppState((prev) => {
+      const remaining = prev.contacts.filter((c) => c.brandId !== brandId);
+      return {
+        ...prev,
+        contacts: remaining,
+      };
+    });
+  };
+
+  const handleAddManualContact = (brandName: string, emailCell: string) => {
+    const extraction = extractEmailsFromCell(emailCell);
     const nowIso = new Date().toISOString();
-    const newContact: Contact = {
-      id: `cnt_${Date.now()}`,
-      brandName,
-      email,
-      status: valid ? 'Pending' : 'Invalid',
-      excluded: !valid,
+    const stamp = Date.now();
+    const brandId = `brand_manual_${stamp}`;
+    const missingBrand = brandName.trim().length === 0;
+
+    const newContacts: Contact[] = extraction.entries.map((entry, idx) => ({
+      id: `cnt_${stamp}_${idx}`,
+      brandId,
+      brandName: brandName.trim(),
+      email: entry.email,
+      recipientIndex: idx + 1,
+      totalBrandRecipients: extraction.entries.length,
+      status: entry.isValid ? 'Pending' : 'Invalid',
+      excluded: !entry.isValid,
       validationFlags: {
-        missingBrand: brandName.length === 0,
-        invalidEmail: !valid,
-        duplicateEmail: prevHasEmail(appState.contacts, email),
-        duplicateBrand: prevHasBrand(appState.contacts, brandName),
+        missingBrand,
+        invalidEmail: !entry.isValid,
+        duplicateEmail: false,
+        duplicateBrand: false,
       },
       importedAt: nowIso,
       sourceFile: 'Manual Entry',
-    };
-
-    setAppState((prev) => ({
-      ...prev,
-      contacts: [newContact, ...prev.contacts],
-      activityLog: appendActivity(
-        'import',
-        `Added contact: ${brandName || email}`,
-        `Status: ${newContact.status}`,
-        prev.activityLog
-      ),
     }));
+
+    setAppState((prev) => {
+      const combined = [...newContacts, ...prev.contacts];
+      const queueBrands = getQueueBrandGroups(combined);
+      const firstBrand = queueBrands[0] || null;
+      const firstRec = firstBrand
+        ? getPreferredRecipientForBrand(firstBrand)
+        : null;
+
+      return {
+        ...prev,
+        contacts: combined,
+        batchState: {
+          ...prev.batchState,
+          currentBrandId:
+            prev.batchState.currentBrandId || firstBrand?.brandId || null,
+          currentRecipientId:
+            prev.batchState.currentRecipientId || firstRec?.id || null,
+        },
+        activityLog: appendActivity(
+          'import',
+          `Added brand: ${brandName || 'Unnamed'} (${newContacts.length} ${
+            newContacts.length === 1 ? 'email' : 'emails'
+          })`,
+          newContacts.map((c) => c.email).join('; '),
+          prev.activityLog
+        ),
+      };
+    });
   };
 
-  const handleOpenContactInBatch = (contactId: string) => {
-    const queue = appState.contacts.filter((c) => !c.excluded);
-    const targetIdx = queue.findIndex((c) => c.id === contactId);
-    if (targetIdx !== -1) {
+  const handleOpenContactInBatch = (contactId: string, brandId?: string) => {
+    const targetContact = appState.contacts.find((c) => c.id === contactId);
+    const resolvedBrandId = brandId || targetContact?.brandId || null;
+
+    if (resolvedBrandId) {
       setAppState((prev) => ({
         ...prev,
         batchState: {
           ...prev.batchState,
-          currentIndex: targetIdx,
+          currentBrandId: resolvedBrandId,
+          currentRecipientId: contactId,
           isPaused: false,
           lastUpdated: new Date().toISOString(),
         },
@@ -262,34 +378,113 @@ export default function App() {
     }));
   };
 
+  /**
+   * Core Brand-by-Brand Sequential Progression Engine (Sections 4, 5, 6)
+   */
   const handleMarkContactStatus = (
     contact: Contact,
     status: 'Prepared' | 'Marked as Sent' | 'Skipped',
-    subjectUsed: string,
-    advanceNext: boolean
+    subjectUsed: string
   ) => {
     const nowIso = new Date().toISOString();
 
+    let completedBrandNameNotice: string | null = null;
+
     setAppState((prev) => {
       const updatedContacts = prev.contacts.map((c) =>
-        c.id === contact.id
-          ? { ...c, status, lastProcessedAt: nowIso }
-          : c
+        c.id === contact.id ? { ...c, status, lastProcessedAt: nowIso } : c
       );
 
-      const queueContacts = updatedContacts.filter((c) => !c.excluded);
-      const currentIdxInQueue = queueContacts.findIndex(
-        (c) => c.id === contact.id
-      );
+      const allQueueBrands = getQueueBrandGroups(updatedContacts);
+      const activeQueueBrands = prev.batchState.batchBrandLimit
+        ? allQueueBrands.slice(
+            prev.batchState.batchBrandOffset || 0,
+            (prev.batchState.batchBrandOffset || 0) +
+              prev.batchState.batchBrandLimit
+          )
+        : allQueueBrands;
 
-      const nextIndex =
-        advanceNext && currentIdxInQueue !== -1
-          ? Math.min(currentIdxInQueue + 1, Math.max(0, queueContacts.length - 1))
-          : prev.batchState.currentIndex;
+      const currentBrandIdx = activeQueueBrands.findIndex(
+        (b) => b.brandId === contact.brandId
+      );
+      const currentBrand =
+        currentBrandIdx !== -1
+          ? activeQueueBrands[currentBrandIdx]
+          : allQueueBrands.find((b) => b.brandId === contact.brandId) || null;
+
+      let nextBrandId = prev.batchState.currentBrandId || contact.brandId;
+      let nextRecipientId: string | null = contact.id;
+
+      if (status === 'Prepared') {
+        // Opening email app NEVER marks email as sent or advances to next recipient
+        nextBrandId = contact.brandId;
+        nextRecipientId = contact.id;
+      } else if (currentBrand) {
+        const currentRecIdx = currentBrand.recipients.findIndex(
+          (r) => r.id === contact.id
+        );
+
+        // Find next pending or prepared valid recipient WITHIN the current brand
+        const remainingInBrandAfterCurrent = currentBrand.recipients
+          .slice(currentRecIdx + 1)
+          .find(
+            (r) =>
+              !r.excluded &&
+              (r.status === 'Pending' || r.status === 'Prepared') &&
+              !r.validationFlags.invalidEmail
+          );
+
+        const remainingInBrandBeforeCurrent = currentBrand.recipients
+          .slice(0, Math.max(0, currentRecIdx))
+          .find(
+            (r) =>
+              !r.excluded &&
+              (r.status === 'Pending' || r.status === 'Prepared') &&
+              !r.validationFlags.invalidEmail
+          );
+
+        const nextPendingInSameBrand =
+          remainingInBrandAfterCurrent || remainingInBrandBeforeCurrent || null;
+
+        if (nextPendingInSameBrand) {
+          // Rule: Never move to the next brand while the current brand still has pending valid recipients
+          nextBrandId = currentBrand.brandId;
+          nextRecipientId = nextPendingInSameBrand.id;
+        } else {
+          // No pending valid recipients remain in currentBrand
+          if (currentBrand.emailsSkipped > 0 || status === 'Skipped') {
+            // Rule (Section 6): If a recipient is skipped, keep the brand marked as NEEDS ATTENTION.
+            // Do not automatically move to the next brand while unresolved recipients remain.
+            nextBrandId = currentBrand.brandId;
+            nextRecipientId = contact.id;
+          } else if (currentBrand.status === 'Completed') {
+            // Rule (Section 4 & 5): Only after all valid recipients have been marked as SENT,
+            // mark brand as COMPLETED and automatically move to the next brand.
+            completedBrandNameNotice = currentBrand.brandName;
+
+            const nextBrandInQueue =
+              activeQueueBrands
+                .slice(currentBrandIdx + 1)
+                .find((b) => b.emailsRemaining > 0) ||
+              activeQueueBrands[currentBrandIdx + 1] ||
+              null;
+
+            if (nextBrandInQueue) {
+              nextBrandId = nextBrandInQueue.brandId;
+              const pref = getPreferredRecipientForBrand(nextBrandInQueue);
+              nextRecipientId = pref?.id || null;
+            } else {
+              nextBrandId = currentBrand.brandId;
+              nextRecipientId = contact.id;
+            }
+          }
+        }
+      }
 
       const newHistoryEntry: HistoryEntry = {
         id: `hist_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         contactId: contact.id,
+        brandId: contact.brandId,
         brandName: contact.brandName || 'Unnamed Brand',
         email: contact.email,
         subject: subjectUsed,
@@ -305,9 +500,13 @@ export default function App() {
 
       const activityTitle =
         status === 'Marked as Sent'
-          ? `Marked email as sent to ${contact.brandName}`
+          ? completedBrandNameNotice
+            ? `${completedBrandNameNotice} ✓ COMPLETED`
+            : `Sent to ${contact.brandName} (${contact.recipientIndex || 1}/${
+                contact.totalBrandRecipients || 1
+              })`
           : status === 'Skipped'
-          ? `Skipped contact ${contact.brandName}`
+          ? `Skipped recipient for ${contact.brandName}`
           : `Prepared email for ${contact.brandName}`;
 
       return {
@@ -316,7 +515,8 @@ export default function App() {
         history: [newHistoryEntry, ...prev.history],
         batchState: {
           ...prev.batchState,
-          currentIndex: nextIndex,
+          currentBrandId: nextBrandId,
+          currentRecipientId: nextRecipientId,
           lastProcessedContactId: contact.id,
           preparedContactIds: Array.from(preparedSet),
           lastUpdated: nowIso,
@@ -331,6 +531,127 @@ export default function App() {
           `${contact.email} · ${subjectUsed}`,
           prev.activityLog
         ),
+      };
+    });
+
+    if (completedBrandNameNotice) {
+      showNotice(
+        'success',
+        `${completedBrandNameNotice} ✓ COMPLETED — Moving to next brand.`
+      );
+    }
+  };
+
+  /**
+   * Explicitly skips all remaining pending recipients in a brand and moves to the next brand.
+   */
+  const handleSkipRemainingInBrand = (
+    brand: BrandGroup,
+    subjectUsed: string
+  ) => {
+    const nowIso = new Date().toISOString();
+
+    setAppState((prev) => {
+      const pendingIds = new Set(
+        brand.recipients
+          .filter(
+            (r) =>
+              !r.excluded &&
+              (r.status === 'Pending' || r.status === 'Prepared') &&
+              !r.validationFlags.invalidEmail
+          )
+          .map((r) => r.id)
+      );
+
+      const updatedContacts = prev.contacts.map((c) =>
+        pendingIds.has(c.id)
+          ? { ...c, status: 'Skipped' as const, lastProcessedAt: nowIso }
+          : c
+      );
+
+      const newHistoryEntries: HistoryEntry[] = brand.recipients
+        .filter((r) => pendingIds.has(r.id))
+        .map((r, idx) => ({
+          id: `hist_${Date.now()}_${idx}_${Math.random()
+            .toString(36)
+            .slice(2, 5)}`,
+          contactId: r.id,
+          brandId: brand.brandId,
+          brandName: brand.brandName,
+          email: r.email,
+          subject: subjectUsed,
+          timestamp: nowIso,
+          status: 'Skipped' as const,
+          emailApp: prev.batchState.selectedEmailApp,
+        }));
+
+      const allQueueBrands = getQueueBrandGroups(updatedContacts);
+      const currentBrandIdx = allQueueBrands.findIndex(
+        (b) => b.brandId === brand.brandId
+      );
+      const nextBrand =
+        allQueueBrands
+          .slice(currentBrandIdx + 1)
+          .find((b) => b.emailsRemaining > 0) ||
+        allQueueBrands[currentBrandIdx + 1] ||
+        allQueueBrands[currentBrandIdx];
+
+      const nextRec = nextBrand ? getPreferredRecipientForBrand(nextBrand) : null;
+      const ackSet = new Set(prev.batchState.acknowledgedBrandIds);
+      ackSet.add(brand.brandId);
+
+      return {
+        ...prev,
+        contacts: updatedContacts,
+        history: [...newHistoryEntries, ...prev.history],
+        batchState: {
+          ...prev.batchState,
+          currentBrandId: nextBrand?.brandId || brand.brandId,
+          currentRecipientId: nextRec?.id || null,
+          acknowledgedBrandIds: Array.from(ackSet),
+          lastUpdated: nowIso,
+        },
+        activityLog: appendActivity(
+          'skipped',
+          `Skipped ${pendingIds.size} remaining recipients in ${brand.brandName}`,
+          `Status: Needs Attention`,
+          prev.activityLog
+        ),
+      };
+    });
+  };
+
+  /**
+   * Explicitly confirms leaving a brand in Needs Attention (with skipped recipients) and advances to the next brand.
+   */
+  const handleConfirmAdvanceFromNeedsAttentionBrand = (brandId: string) => {
+    const nowIso = new Date().toISOString();
+
+    setAppState((prev) => {
+      const allQueueBrands = getQueueBrandGroups(prev.contacts);
+      const currentBrandIdx = allQueueBrands.findIndex(
+        (b) => b.brandId === brandId
+      );
+      const nextBrand =
+        allQueueBrands
+          .slice(currentBrandIdx + 1)
+          .find((b) => b.emailsRemaining > 0) ||
+        allQueueBrands[currentBrandIdx + 1] ||
+        allQueueBrands[currentBrandIdx];
+
+      const nextRec = nextBrand ? getPreferredRecipientForBrand(nextBrand) : null;
+      const ackSet = new Set(prev.batchState.acknowledgedBrandIds);
+      ackSet.add(brandId);
+
+      return {
+        ...prev,
+        batchState: {
+          ...prev.batchState,
+          currentBrandId: nextBrand?.brandId || brandId,
+          currentRecipientId: nextRec?.id || null,
+          acknowledgedBrandIds: Array.from(ackSet),
+          lastUpdated: nowIso,
+        },
       };
     });
   };
@@ -451,7 +772,18 @@ export default function App() {
     { id: 'settings', label: 'Settings', icon: Settings },
   ];
 
-  const eligibleQueueCount = appState.contacts.filter((c) => !c.excluded).length;
+  const brandGroups = useMemo(
+    () => buildBrandGroups(appState.contacts),
+    [appState.contacts]
+  );
+  const queueBrands = useMemo(
+    () => getQueueBrandGroups(appState.contacts),
+    [appState.contacts]
+  );
+  const completedBrandsCount = useMemo(
+    () => brandGroups.filter((b) => b.status === 'Completed').length,
+    [brandGroups]
+  );
 
   return (
     <div className="flex min-h-screen bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
@@ -488,9 +820,9 @@ export default function App() {
                     <Icon className="h-4 w-4 shrink-0" />
                     <span>{item.label}</span>
                   </span>
-                  {item.id === 'contacts' && appState.contacts.length > 0 && (
+                  {item.id === 'contacts' && brandGroups.length > 0 && (
                     <span className="font-mono text-[11px] tabular-nums text-slate-400">
-                      {appState.contacts.length}
+                      {brandGroups.length}
                     </span>
                   )}
                 </button>
@@ -502,13 +834,19 @@ export default function App() {
         {/* Quiet Sidebar Footer Summary */}
         <div className="border-t border-slate-200 pt-4 px-2 text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">
           <div className="flex items-center justify-between">
-            <span>Queue Ready</span>
+            <span>Brands Queued</span>
             <span className="font-mono font-medium text-slate-800 tabular-nums dark:text-slate-200">
-              {eligibleQueueCount}
+              {queueBrands.length}
             </span>
           </div>
           <div className="mt-1 flex items-center justify-between">
-            <span>Marked as Sent</span>
+            <span>Brands Completed</span>
+            <span className="font-mono font-medium text-emerald-600 tabular-nums dark:text-emerald-400">
+              {completedBrandsCount}
+            </span>
+          </div>
+          <div className="mt-1 flex items-center justify-between">
+            <span>Emails Sent</span>
             <span className="font-mono font-medium text-emerald-600 tabular-nums dark:text-emerald-400">
               {
                 appState.contacts.filter((c) => c.status === 'Marked as Sent')
@@ -532,7 +870,7 @@ export default function App() {
             MailPilot
           </button>
 
-          {/* Zone 2: Concise single-line navigation links (visible on mobile/tablet and desktop) */}
+          {/* Zone 2: Concise single-line navigation links */}
           <nav className="hidden md:flex items-center gap-6 text-xs font-medium text-slate-600 dark:text-slate-400">
             <button
               type="button"
@@ -593,14 +931,14 @@ export default function App() {
 
           {/* Zone 3: 1 Primary Action */}
           <div className="flex items-center shrink-0">
-            {eligibleQueueCount > 0 && activeTab !== 'batch' ? (
+            {queueBrands.length > 0 && activeTab !== 'batch' ? (
               <button
                 type="button"
                 onClick={() => setActiveTab('batch')}
-                className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
+                className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
               >
                 <Send className="h-3.5 w-3.5" />
-                <span>Start Sending ({eligibleQueueCount})</span>
+                <span>Start Sending ({queueBrands.length} Brands)</span>
               </button>
             ) : (
               <button
@@ -609,7 +947,7 @@ export default function App() {
                   setPreloadedAnalysis(null);
                   setIsImportModalOpen(true);
                 }}
-                className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
+                className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
               >
                 <Upload className="h-3.5 w-3.5" />
                 <span>Import Contacts</span>
@@ -618,7 +956,7 @@ export default function App() {
           </div>
         </header>
 
-        {/* Mobile Navigation Strip (visible only on small screens) */}
+        {/* Mobile Navigation Strip */}
         <div className="flex items-center gap-1 overflow-x-auto border-b border-slate-200 bg-white px-4 py-2 md:hidden dark:border-slate-800 dark:bg-slate-900">
           {navItems.map((item) => (
             <button
@@ -682,6 +1020,7 @@ export default function App() {
               }}
               onUpdateContact={handleUpdateContact}
               onDeleteContact={handleDeleteContact}
+              onDeleteBrandGroup={handleDeleteBrandGroup}
               onAddManualContact={handleAddManualContact}
               onOpenInBatchWorkspace={handleOpenContactInBatch}
             />
@@ -695,6 +1034,10 @@ export default function App() {
               onUpdateBatchState={handleUpdateBatchState}
               onUpdateContact={handleUpdateContact}
               onMarkContactStatus={handleMarkContactStatus}
+              onSkipRemainingInBrand={handleSkipRemainingInBrand}
+              onConfirmAdvanceFromNeedsAttentionBrand={
+                handleConfirmAdvanceFromNeedsAttentionBrand
+              }
               onOpenImportModal={() => {
                 setPreloadedAnalysis(null);
                 setIsImportModalOpen(true);
@@ -716,6 +1059,7 @@ export default function App() {
             <HistoryView
               history={appState.history}
               contacts={appState.contacts}
+              onResumeBrandInBatch={handleOpenContactInBatch}
             />
           )}
 
@@ -746,16 +1090,4 @@ export default function App() {
       />
     </div>
   );
-}
-
-function prevHasEmail(contacts: Contact[], email: string): boolean {
-  const clean = email.trim().toLowerCase();
-  if (!clean) return false;
-  return contacts.some((c) => c.email.trim().toLowerCase() === clean);
-}
-
-function prevHasBrand(contacts: Contact[], brand: string): boolean {
-  const clean = brand.trim().toLowerCase();
-  if (!clean) return false;
-  return contacts.some((c) => c.brandName.trim().toLowerCase() === clean);
 }

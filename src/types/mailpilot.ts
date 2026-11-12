@@ -5,6 +5,13 @@ export type ContactStatus =
   | 'Skipped'
   | 'Invalid';
 
+export type BrandStatus =
+  | 'Pending'
+  | 'In Progress'
+  | 'Completed'
+  | 'Needs Attention'
+  | 'Invalid';
+
 export type EmailAppType =
   | 'thunderbird_mailto'
   | 'default_mailto'
@@ -25,12 +32,16 @@ export interface ValidationFlags {
   invalidEmail: boolean;
   duplicateEmail: boolean;
   duplicateBrand: boolean;
+  duplicateWithinBrand?: boolean;
 }
 
 export interface Contact {
   id: string;
+  brandId: string;
   brandName: string;
   email: string;
+  recipientIndex?: number;
+  totalBrandRecipients?: number;
   status: ContactStatus;
   excluded: boolean;
   validationFlags: ValidationFlags;
@@ -40,6 +51,32 @@ export interface Contact {
   lastProcessedAt?: string;
   sourceFile?: string;
   sheetName?: string;
+  phone?: string;
+  websiteNotes?: string;
+  sourceList?: string;
+  rawRowData?: Record<string, string>;
+}
+
+export interface BrandGroup {
+  brandId: string;
+  brandName: string;
+  recipients: Contact[];
+  totalEmailsFound: number;
+  validEmailCount: number;
+  invalidEmailCount: number;
+  emailsSent: number;
+  emailsSkipped: number;
+  emailsPrepared: number;
+  emailsRemaining: number;
+  status: BrandStatus;
+  excluded: boolean;
+  phone?: string;
+  websiteNotes?: string;
+  sourceList?: string;
+  sourceFile?: string;
+  sheetName?: string;
+  importedAt: string;
+  lastProcessedAt?: string;
 }
 
 export interface EmailTemplate {
@@ -54,6 +91,7 @@ export interface EmailTemplate {
 export interface HistoryEntry {
   id: string;
   contactId: string;
+  brandId?: string;
   brandName: string;
   email: string;
   subject: string;
@@ -72,6 +110,11 @@ export interface ActivityLogItem {
 
 export interface BatchQueueState {
   currentIndex: number;
+  currentBrandId: string | null;
+  currentRecipientId: string | null;
+  acknowledgedBrandIds: string[];
+  batchBrandLimit: number | null;
+  batchBrandOffset: number;
   isActive: boolean;
   isPaused: boolean;
   selectedTemplateId: string;
@@ -93,18 +136,28 @@ export interface ParsedSheetData {
   rows: Record<string, string>[];
   detectedBrandCol: string | null;
   detectedEmailCol: string | null;
+  detectedPhoneCol?: string | null;
+  detectedWebsiteCol?: string | null;
+  detectedSourceCol?: string | null;
   confidence: 'high' | 'uncertain';
   emptyRowsCount: number;
 }
 
 export interface CandidateContact {
   tempId: string;
+  brandTempId: string;
   rowNumber: number;
   brandName: string;
   email: string;
+  recipientIndex: number;
+  totalBrandRecipients: number;
   status: ContactStatus;
   excluded: boolean;
   validationFlags: ValidationFlags;
+  phone?: string;
+  websiteNotes?: string;
+  sourceList?: string;
+  rawRowData?: Record<string, string>;
 }
 
 export interface ImportAnalysisResult {
@@ -117,6 +170,8 @@ export interface ImportAnalysisResult {
   candidates: CandidateContact[];
   summary: {
     totalRowsRead: number;
+    totalBrandsDetected: number;
+    totalEmailsExtracted: number;
     emptyRowsIgnored: number;
     validCount: number;
     missingBrandCount: number;

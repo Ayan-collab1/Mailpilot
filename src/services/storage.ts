@@ -6,6 +6,7 @@ import {
   EmailTemplate,
   HistoryEntry,
 } from '../types/mailpilot';
+import { buildBrandGroups } from '../utils/brandQueue';
 
 const DB_NAME = 'MailPilotDB';
 const DB_VERSION = 1;
@@ -81,6 +82,11 @@ export const INITIAL_SETTINGS: AppSettings = {
 
 export const INITIAL_BATCH_STATE: BatchQueueState = {
   currentIndex: 0,
+  currentBrandId: null,
+  currentRecipientId: null,
+  acknowledgedBrandIds: [],
+  batchBrandLimit: null,
+  batchBrandOffset: 0,
   isActive: false,
   isPaused: false,
   selectedTemplateId: 'tpl_brand_collab_default',
@@ -137,16 +143,18 @@ function openIndexedDB(): Promise<IDBDatabase> {
 }
 
 export async function loadAppState(): Promise<PersistentAppState> {
-  // First try IndexedDB, with synchronous fallback from localStorage
   try {
     const db = await openIndexedDB();
-    const idbData = await new Promise<PersistentAppState | undefined>((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const store = tx.objectStore(STORE_NAME);
-      const req = store.get('root');
-      req.onsuccess = () => resolve(req.result as PersistentAppState | undefined);
-      req.onerror = () => reject(req.error);
-    });
+    const idbData = await new Promise<PersistentAppState | undefined>(
+      (resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readonly');
+        const store = tx.objectStore(STORE_NAME);
+        const req = store.get('root');
+        req.onsuccess = () =>
+          resolve(req.result as PersistentAppState | undefined);
+        req.onerror = () => reject(req.error);
+      }
+    );
     db.close();
 
     if (idbData && Array.isArray(idbData.templates)) {
@@ -169,14 +177,15 @@ export async function loadAppState(): Promise<PersistentAppState> {
   return INITIAL_STATE;
 }
 
-function mergeWithDefaults(partial: Partial<PersistentAppState>): PersistentAppState {
+export function mergeWithDefaults(
+  partial: Partial<PersistentAppState>
+): PersistentAppState {
   const templates =
     Array.isArray(partial.templates) && partial.templates.length > 0
       ? partial.templates
       : INITIAL_TEMPLATES;
   const defaultTpl = templates.find((t) => t.isDefault) || templates[0];
 
-  // Ensure we do not default to hardcoded gmail from earlier schema versions unless explicitly changed
   const rawDefaultApp = partial.settings?.defaultEmailApp;
   const migratedDefaultApp =
     !rawDefaultApp || rawDefaultApp === 'gmail'
@@ -200,9 +209,105 @@ function mergeWithDefaults(partial: Partial<PersistentAppState>): PersistentAppS
         : defaultTpl.id,
   };
 
+  // Migrate legacy contacts without brandId into deterministic brand groups
+  const legacyBrandIds = new Map<string, string>();
+  const normalizedContacts: Contact[] = Array.isArray(partial.contacts)
+    ? partial.contacts.map((c, idx) => {
+        const brandName = typeof c.brandName === 'string' ? c.brandName : '';
+        let brandId = typeof c.brandId === 'string' ? c.brandId : '';
+        if (!brandId) {
+          const brandKey = brandName.trim().toLowerCase();
+          if (brandKey && legacyBrandIds.has(brandKey)) {
+            brandId = legacyBrandIds.get(brandKey)!;
+          } else {
+            brandId = `brand_migrated_${idx}_${brandKey.replace(/[^a-z0-9]/g, '_') || 'unnamed'}`;
+            if (brandKey) {
+              legacyBrandIds.set(brandKey, brandId);
+            }
+          }
+        }
+
+        return {
+          id: c.id || `cnt_restored_${idx}`,
+          brandId,
+          brandName,
+          email: typeof c.email === 'string' ? c.email : '',
+          recipientIndex: c.recipientIndex,
+          totalBrandRecipients: c.totalBrandRecipients,
+          status: c.status || 'Pending',
+          excluded: Boolean(c.excluded),
+          validationFlags: {
+            missingBrand: Boolean(c.validationFlags?.missingBrand),
+            invalidEmail: Boolean(c.validationFlags?.invalidEmail),
+            duplicateEmail: Boolean(c.validationFlags?.duplicateEmail),
+            duplicateBrand: Boolean(c.validationFlags?.duplicateBrand),
+            duplicateWithinBrand: Boolean(
+              c.validationFlags?.duplicateWithinBrand
+            ),
+          },
+          customSubject: c.customSubject,
+          customBody: c.customBody,
+          importedAt: c.importedAt || new Date().toISOString(),
+          lastProcessedAt: c.lastProcessedAt,
+          sourceFile: c.sourceFile,
+          sheetName: c.sheetName,
+          phone: c.phone,
+          websiteNotes: c.websiteNotes,
+          sourceList: c.sourceList,
+          rawRowData: c.rawRowData,
+        };
+      })
+    : [];
+
+  // Re-populate recipientIndex and totalBrandRecipients from brand groupings
+  const brandGroups = buildBrandGroups(normalizedContacts);
+  const enrichedMap = new Map<string, Contact>();
+  for (const bg of brandGroups) {
+    for (const r of bg.recipients) {
+      enrichedMap.set(r.id, r);
+    }
+  }
+  const finalContacts = normalizedContacts.map(
+    (c) => enrichedMap.get(c.id) || c
+  );
+
+  // Resolve currentBrandId and currentRecipientId if migrating from flat currentIndex
+  const rawCurrentBrandId = partial.batchState?.currentBrandId ?? null;
+  const rawCurrentRecipientId = partial.batchState?.currentRecipientId ?? null;
+  let resolvedBrandId = rawCurrentBrandId;
+  let resolvedRecipientId = rawCurrentRecipientId;
+
+  if (!resolvedBrandId && finalContacts.length > 0) {
+    const queueContacts = finalContacts.filter((c) => !c.excluded);
+    const legacyIdx = Math.min(
+      Math.max(0, partial.batchState?.currentIndex || 0),
+      Math.max(0, queueContacts.length - 1)
+    );
+    const targetContact = queueContacts[legacyIdx] || finalContacts[0];
+    if (targetContact) {
+      resolvedBrandId = targetContact.brandId;
+      resolvedRecipientId = targetContact.id;
+    }
+  }
+
   const batchState: BatchQueueState = {
     ...INITIAL_BATCH_STATE,
     ...(partial.batchState || {}),
+    currentBrandId: resolvedBrandId,
+    currentRecipientId: resolvedRecipientId,
+    acknowledgedBrandIds: Array.isArray(
+      partial.batchState?.acknowledgedBrandIds
+    )
+      ? partial.batchState!.acknowledgedBrandIds
+      : [],
+    batchBrandLimit:
+      partial.batchState?.batchBrandLimit !== undefined
+        ? partial.batchState.batchBrandLimit
+        : null,
+    batchBrandOffset:
+      typeof partial.batchState?.batchBrandOffset === 'number'
+        ? partial.batchState.batchBrandOffset
+        : 0,
     selectedTemplateId:
       partial.batchState?.selectedTemplateId &&
       templates.some((t) => t.id === partial.batchState?.selectedTemplateId)
@@ -214,30 +319,8 @@ function mergeWithDefaults(partial: Partial<PersistentAppState>): PersistentAppS
       : [],
   };
 
-  const normalizedContacts: Contact[] = Array.isArray(partial.contacts)
-    ? partial.contacts.map((c, idx) => ({
-        id: c.id || `cnt_restored_${idx}`,
-        brandName: typeof c.brandName === 'string' ? c.brandName : '',
-        email: typeof c.email === 'string' ? c.email : '',
-        status: c.status || 'Pending',
-        excluded: Boolean(c.excluded),
-        validationFlags: {
-          missingBrand: Boolean(c.validationFlags?.missingBrand),
-          invalidEmail: Boolean(c.validationFlags?.invalidEmail),
-          duplicateEmail: Boolean(c.validationFlags?.duplicateEmail),
-          duplicateBrand: Boolean(c.validationFlags?.duplicateBrand),
-        },
-        customSubject: c.customSubject,
-        customBody: c.customBody,
-        importedAt: c.importedAt || new Date().toISOString(),
-        lastProcessedAt: c.lastProcessedAt,
-        sourceFile: c.sourceFile,
-        sheetName: c.sheetName,
-      }))
-    : [];
-
   return {
-    contacts: normalizedContacts,
+    contacts: finalContacts,
     templates,
     history: Array.isArray(partial.history) ? partial.history : [],
     activityLog: Array.isArray(partial.activityLog) ? partial.activityLog : [],
@@ -247,14 +330,12 @@ function mergeWithDefaults(partial: Partial<PersistentAppState>): PersistentAppS
 }
 
 export async function saveAppState(state: PersistentAppState): Promise<void> {
-  // Save to localStorage synchronously for instant page-refresh resilience
   try {
     localStorage.setItem(LS_FALLBACK_KEY, JSON.stringify(state));
   } catch {
     // Ignore quota errors
   }
 
-  // Save to IndexedDB for large contact lists
   try {
     const db = await openIndexedDB();
     await new Promise<void>((resolve, reject) => {
@@ -272,7 +353,12 @@ export async function saveAppState(state: PersistentAppState): Promise<void> {
 
 export function escapeCsvCell(value: string): string {
   const str = String(value ?? '');
-  if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+  if (
+    str.includes(',') ||
+    str.includes('"') ||
+    str.includes('\n') ||
+    str.includes('\r')
+  ) {
     return `"${str.replace(/"/g, '""')}"`;
   }
   return str;
@@ -296,7 +382,9 @@ export function exportHistoryToCsv(history: HistoryEntry[]): void {
     escapeCsvCell(h.emailApp),
   ]);
 
-  const csvContent = [headers.join(','), ...rows.map((r) => r.join(','))].join('\r\n');
+  const csvContent = [headers.join(','), ...rows.map((r) => r.join(','))].join(
+    '\r\n'
+  );
   triggerFileDownload(
     csvContent,
     `MailPilot_Sending_History_${new Date().toISOString().slice(0, 10)}.csv`,
@@ -305,24 +393,48 @@ export function exportHistoryToCsv(history: HistoryEntry[]): void {
 }
 
 export function exportContactsAndProgressToCsv(contacts: Contact[]): void {
+  const brandGroups = buildBrandGroups(contacts);
+  const brandStatusMap = new Map<string, string>();
+  for (const bg of brandGroups) {
+    brandStatusMap.set(bg.brandId, bg.status);
+  }
+
   const headers = [
     'Brand Name',
+    'Recipient #',
     'Email Address',
-    'Status',
+    'Recipient Status',
+    'Brand Status',
     'Queue Inclusion',
+    'Phone Number',
+    'Website / Notes',
+    'Source List',
     'Source File',
     'Last Processed',
   ];
   const rows = contacts.map((c) => [
     escapeCsvCell(c.brandName),
+    escapeCsvCell(
+      c.recipientIndex && c.totalBrandRecipients
+        ? `${c.recipientIndex}/${c.totalBrandRecipients}`
+        : '1/1'
+    ),
     escapeCsvCell(c.email),
     escapeCsvCell(c.status),
+    escapeCsvCell(brandStatusMap.get(c.brandId) || 'Pending'),
     escapeCsvCell(c.excluded ? 'Excluded' : 'Included'),
+    escapeCsvCell(c.phone || ''),
+    escapeCsvCell(c.websiteNotes || ''),
+    escapeCsvCell(c.sourceList || ''),
     escapeCsvCell(c.sourceFile || 'Manual / Imported'),
-    escapeCsvCell(c.lastProcessedAt ? new Date(c.lastProcessedAt).toLocaleString() : '—'),
+    escapeCsvCell(
+      c.lastProcessedAt ? new Date(c.lastProcessedAt).toLocaleString() : '—'
+    ),
   ]);
 
-  const csvContent = [headers.join(','), ...rows.map((r) => r.join(','))].join('\r\n');
+  const csvContent = [headers.join(','), ...rows.map((r) => r.join(','))].join(
+    '\r\n'
+  );
   triggerFileDownload(
     csvContent,
     `MailPilot_Contacts_Progress_${new Date().toISOString().slice(0, 10)}.csv`,
@@ -339,7 +451,11 @@ export function exportFullBackupJson(state: PersistentAppState): void {
   );
 }
 
-function triggerFileDownload(content: string, fileName: string, mimeType: string): void {
+function triggerFileDownload(
+  content: string,
+  fileName: string,
+  mimeType: string
+): void {
   const blob = new Blob([content], { type: mimeType });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
